@@ -1,0 +1,9 @@
+Requirements:
+
+ - agent
+   - decide function
+   - train
+   - (network)
+ - history
+   - state/action/next_state/reward combos
+ - game environment
