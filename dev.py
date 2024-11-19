@@ -6,10 +6,20 @@ Created on Wed Oct 23 12:45:16 2024
 """
 
 import numpy as np
+import random
+import torch
+from torch import tensor
+from torch import nn
+from torch.nn import Conv1d, Conv2d, Conv3d
+from collections import deque
+from matplotlib import pyplot as plt
+import time
 
 class Agent:
     
-    def __init__(self):
+    def __init__(self, gamma=0.95, epsilon=0.1):
+        self.gamma = gamma          # reward discount per step
+        self.epsilon = epsilon      # exploration control
         pass
     
 
@@ -41,6 +51,19 @@ def idx_to_rowcol(idx):
 def rowcol_to_idx(row, col):
     
     return 3 * row + col
+
+def onehot_mask(list_of_indexes, length):
+    
+    oh_list = [False] * length
+    for idx in list_of_indexes:
+        oh_list[idx] = True
+    
+    return oh_list
+
+def moving_average(a, n=1000):
+    ret = np.cumsum(a, dtype=float)
+    ret[n:] = ret[n:] - ret[:-n]
+    return ret[n - 1:] / n
 
 class TTTBoard:
     
@@ -82,13 +105,16 @@ class TTTBoard:
 
 class TicTacToe(Game):
     
-    def __init__(self, players):
+    def __init__(self, players, show=False):
         super().__init__()
         self.board = TTTBoard()
         self.players = players
+        self.show = show
         self.current_player_index = None
         self.current_player = None
         self.winner = None
+        self.winner_index = None
+        self.rewards = None
         
         for player in self.players:
             player.attach_game(self)
@@ -126,15 +152,11 @@ class TicTacToe(Game):
                 
                 # row
                 if (self.board.board[i] == player_id).all():
-                    # print('Player {} wins'.format(player_id))
-                    # self.winner = player
                     self.on_game_end(player)
                     return True
                 
                 # col
                 if (self.board.board[:,i] == player_id).all():
-                    # print('Player {} wins'.format(player_id))
-                    # self.winner = player
                     self.on_game_end(player)
                     return True
                 
@@ -148,7 +170,6 @@ class TicTacToe(Game):
         
         # check for tie (all places filled)
         if len(self.possible_moves(self.current_player)) == 0:
-            # print('Tie')
             self.on_game_end(None)
             return True
         
@@ -156,28 +177,58 @@ class TicTacToe(Game):
     
     def on_game_end(self, winner):
         
-        self.board.show_board()
+        if self.show:
+            self.board.show_board()
         
         if winner is None:
-            print('Tie')
+            if self.show:
+                print('Tie')
+            self.rewards = [0,0]
         
         else:
-            print('Player {} wins'.format(winner.player_id))
+            if self.show:
+                print('Player {} wins'.format(winner.player_id))
             self.winner = winner
             
-
-    
+            self.rewards = []
+            for i, player in enumerate((self.players)):
+                if player == winner:
+                    reward = 1
+                    self.winner_index = i
+                else:
+                    reward = -1
+                
+                self.rewards.append(reward)
+                
+                player.on_game_end(reward)
+            
+  
     def play_game(self):
         
-        self.board.show_board()
+        for player in self.players:
+            player.clear()
+        
+        if self.show:
+            self.board.show_board()
 
         while not self.is_game_over():
                         
             self.next_player()
             self.current_player.turn()
 
-            self.board.show_board()
+            if self.show:
+                self.board.show_board()
+
+    def encode_state(self, player):
         
+        player_id = player.player_id
+        
+        me_mask = torch.tensor(self.board.board == player_id, dtype=torch.float32)
+        them_mask = torch.tensor(self.board.board == -player_id, dtype=torch.float32)
+        
+        state = torch.stack([me_mask, them_mask])
+        
+        return state
 
 class TTTPlayer(Player):
     
@@ -186,42 +237,271 @@ class TTTPlayer(Player):
         self.game = None
         self.agent = agent
         super().__init__(player_id, self.game, self.agent)
+        self.clear()
     
     def attach_game(self, game):
         self.game = game
-    
+
+    def clear(self):
+        # at init and game start
+        
+        self.states = []
+        self.possible_actions = []
+        self.actions = []
+        
     def turn(self):
         
         assert self.game is not None, 'No game attached to player {}'.format(self.player_id)
         
+        # record state
+        self.states.append(self.game.encode_state(self))
+        
         possible_moves = self.game.possible_moves(self)
-        action = self.agent.choose(possible_moves)
+        # record possible actions
+        self.possible_actions.append(onehot_mask(possible_moves, 9))
+
+        action = self.agent.choose(self.game, self, possible_moves)        
+        # record action
+        self.actions.append(action)
         
         row, col = idx_to_rowcol(action)
         self.game.board.place_piece(row, col, self.player_id)
-            
+    
+    def on_game_end(self, final_reward):
+        
+        states = self.states
+        next_states = self.states[1:] + [states[-1]]   # last entry should not matter (fr_mix == 1)
+        next_state_possible_actions = self.possible_actions[1:] + [self.possible_actions[-1]]
+        
+        assert len(self.actions) == len(next_states) == len(states)
+        
+        # mix final reward with stage-by-stage
+        fr_mix = np.ones_like(self.actions, dtype=np.float32)
+        for i in range(1, len(fr_mix)):
+            fr_mix[i] = fr_mix[i-1]*self.agent.gamma
+        # reverse
+        fr_mix = fr_mix[::-1]    # 0-1
+       
+        for s, a, ns, nspa, fr_m in zip(states, self.actions, next_states, next_state_possible_actions, fr_mix):
+            self.agent.history.update(s, a, ns, nspa, fr_m, final_reward)
+        
 
-# board = TTTBoard()
-# board.show_board()
-# board.place_piece(1, 2, 1)
-# board.show_board()
-# board.place_piece(1, 1, -1)
-# board.show_board()
+
+class History:
+
+    def __init__(self, max_len=1e5):
+        self.states = deque()
+        self.actions = deque()
+        self.next_states = deque()
+        self.next_state_possible_actions = deque()
+        self.fr_mix = deque()
+        self.final_rewards = deque()
+        self.max_len = max_len
+        self.length = 0
+
+    def update(self, state, action, next_state, nspa, fr_mix, final_reward):
+        self.states.append(state)
+        self.actions.append(action)
+        self.next_states.append(next_state)
+        self.next_state_possible_actions.append(nspa)
+        self.fr_mix.append(fr_mix)
+        self.final_rewards.append(final_reward)
+        self.length += 1
+        
+        if len(self.actions) > self.max_len:
+
+            for dat in [self.states, self.actions, self.next_states, self.next_state_possible_actions, self.fr_mix, self.final_rewards]:
+                dat.popleft()
+                assert len(dat) <= self.max_len
+            self.length -= 1
+            
+        assert self.length == len(self.actions), 'Invalid length for History'
+
+    def yield_batch(self, batch_size):
+        bs = batch_size if len(self.actions) >= batch_size else len(self.actions)
+        
+        # choose randomly without deletion
+        batch_idxs = random.sample(range(self.length), bs)
+        
+        batch_states = [self.states[i] for i in batch_idxs]
+        batch_actions = [self.actions[i] for i in batch_idxs]
+        batch_next_states = [self.next_states[i] for i in batch_idxs]
+        batch_nspas = [self.next_state_possible_actions[i] for i in batch_idxs]
+        batch_fr_mix = [self.fr_mix[i] for i in batch_idxs]
+        batch_final_rewards = [self.final_rewards[i] for i in batch_idxs]
+        
+        batch_states = torch.stack(batch_states)
+        batch_actions = torch.tensor(batch_actions, dtype=int)
+        batch_next_states = torch.stack(batch_next_states)
+        batch_nspas = torch.tensor(batch_nspas)
+        batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32)
+        batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32)
+        
+        return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards
+        
 
 class TTTRandomAgent(Agent):
     
     def __init__(self):
         super().__init__()
-    
-    def choose(self, possible_moves):
+        self.history = History()
+        
+    def choose(self, game, player, possible_moves):
         
         return np.random.choice(possible_moves)
+
+class DLAgent(Agent):
+
+    def __init__(self, model):
+        super().__init__()
+        self.history = History()
+        self.model = model
+        self.losses = []
+        
+    def choose(self, game, player, possible_moves):
+        
+        self.model.eval()
+        
+        encoded_state = game.encode_state(player)
+        batched_state = encoded_state.unsqueeze(0)
+        output = self.model(batched_state)
+        
+        # todo various choice algos (prob distribution, eps-greedy etc.)
+        if random.random() < self.epsilon:
+            return np.random.choice(possible_moves)
+        else:
+            # greedy
+            possible_moves_outputs = output[0][possible_moves]
+            best_move_idx = possible_moves_outputs.argmax()
+            best_move = possible_moves[best_move_idx]
+            
+            return best_move
+
+    def train_batch(self, batch_size=16):
+        
+        self.model.train()
+                
+        (batch_states, 
+         batch_actions, 
+         batch_next_states, 
+         batch_nspas, 
+         batch_fr_mix, 
+         batch_final_rewards) = self.history.yield_batch(batch_size)
+                
+        outputs = self.model(batch_states)
+        # outputs = outputs.squeeze()
+        state_action_outputs = outputs.gather(1, batch_actions.unsqueeze(-1))
+        
+        with torch.no_grad():
+            next_state_outputs = self.model(batch_next_states)
+            
+            # apply mask
+            next_state_outputs[~batch_nspas] = -np.inf
+            
+            # get value using max
+            next_state_values = next_state_outputs.max(axis=1)
+            next_state_values = next_state_values.values
+        
+        targets = batch_fr_mix * batch_final_rewards + (1 - batch_fr_mix) * next_state_values
+
+        
+        loss = self.model.loss(state_action_outputs, targets)
+        self.model.optimizer.zero_grad()
+        loss.backward()
+        
+        loss_scalar = loss.item()
+        # print('Loss: {:.5f}'.format(loss_scalar))
+        self.losses.append(loss_scalar)
+        
+        self.model.optimizer.step()
+    
+    def train_n_batches(self, n, batch_size=16):
+        
+        for i in range(n):
+            self.train_batch(batch_size=batch_size)
+                
+
+class ConvModel(nn.Module):
+
+    def __init__(self, layer_1_size, linear_size, lr=1e-3):
+        super().__init__()
+        self.layer_1_size = layer_1_size
+        self.linear_size = linear_size
+        self.lr = lr
+        
+        self.conv1 = Conv2d(2, layer_1_size, 3, padding='same')
+        self.bn1 = nn.BatchNorm2d(layer_1_size)
+        
+        self.linear1 = nn.Linear(layer_1_size * 3 * 3, linear_size)
+        self.linear2 = nn.Linear(linear_size, 9)
+
+        self.activation = nn.LeakyReLU()
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        self.loss = nn.SmoothL1Loss()
+        
+        
+    def forward(self, x):
+        
+        c = self.conv1(x)
+        c = self.bn1(c)
+        
+        c = c.flatten(start_dim=1)
+        
+        c = self.activation(c)
+        
+        l = self.linear1(c)
+        l = self.activation(l)
+        l = self.linear2(l)
+        
+        return l    
+    
 
 # trial random game
 random_agent = TTTRandomAgent()
 playerX = TTTPlayer(1, random_agent)
-playerO = TTTPlayer(-1, random_agent)
+
+model = ConvModel(32, 16)
+dlagent = DLAgent(model)
+playerO = TTTPlayer(-1, dlagent)
 players = [playerX, playerO]
 
-game = TicTacToe(players)
-game.play_game()
+def play_series(players, num_games):
+    
+    win_counter = [0 for p in players] + [0] # ties
+    
+    for i in range(num_games):
+        
+        game = TicTacToe(players)
+        game.play_game()
+        
+        if game.winner_index is None:
+            win_counter[-1] += 1
+        else:
+            win_counter[game.winner_index] += 1
+    
+    names = ['X', 'O', 'Tie']
+    plt.bar(names, win_counter)
+    plt.show()
+
+start_time = time.time()
+
+play_series(players, 1000)
+
+for i in range(5):
+    
+    print()
+    print(i)
+    
+    playerO.agent.train_n_batches(100)
+    plt.plot(moving_average(playerO.agent.losses))
+    plt.show()
+    
+    play_series(players, 1000)
+
+end_time = time.time()
+tdiff = end_time - start_time
+
+plt.plot(moving_average(playerO.agent.losses))
+
+print('Time taken: {:.2f} s'.format(tdiff))

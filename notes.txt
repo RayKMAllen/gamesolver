@@ -7,3 +7,8 @@ Requirements:
  - history
    - state/action/next_state/reward combos
  - game environment
+ 
+
+Ideas:
+
+ - shared or separate history?
