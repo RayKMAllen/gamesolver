@@ -8,12 +8,21 @@ Created on Wed Oct 23 12:45:16 2024
 import numpy as np
 import random
 import torch
+import torch_directml
 from torch import tensor
 from torch import nn
 from torch.nn import Conv1d, Conv2d, Conv3d
 from collections import deque
 from matplotlib import pyplot as plt
 import time
+import asyncio
+import nest_asyncio
+
+from utils import Profiler
+
+nest_asyncio.apply()
+
+# dml = torch_directml.device()    
 
 class Agent:
     
@@ -103,6 +112,8 @@ class TTTBoard:
         
         self.board[row][col] = player_id
 
+profiler = Profiler()
+
 class TicTacToe(Game):
     
     def __init__(self, players, show=False):
@@ -116,8 +127,15 @@ class TicTacToe(Game):
         self.winner_index = None
         self.rewards = None
         
+        self.states = {}
+        self.possible_actions = {}
+        self.actions = {}
+                
         for player in self.players:
             player.attach_game(self)
+            self.states[player] = []
+            self.possible_actions[player] = []
+            self.actions[player] = []
         
     def first_player_index(self):
         
@@ -149,24 +167,34 @@ class TicTacToe(Game):
             player_id = player.player_id
             
             for i in range(3):
+
+                # profiler.log('20')
                 
                 # row
                 if (self.board.board[i] == player_id).all():
+                    # profiler.log('21')
                     self.on_game_end(player)
                     return True
+                # profiler.log('21')
                 
                 # col
                 if (self.board.board[:,i] == player_id).all():
+                    # profiler.log('22')
                     self.on_game_end(player)
                     return True
+                # profiler.log('22')
                 
                 # diags
                 if (self.board.board.diagonal() == player_id).all():
+                    # profiler.log('23')
                     self.on_game_end(player)
                     return True
+                # profiler.log('23')
                 if (self.board.board[::-1].diagonal() == player_id).all():
+                    # profiler.log('24')
                     self.on_game_end(player)
                     return True
+                # profiler.log('24')
         
         # check for tie (all places filled)
         if len(self.possible_moves(self.current_player)) == 0:
@@ -176,6 +204,8 @@ class TicTacToe(Game):
         return False
     
     def on_game_end(self, winner):
+
+        # profiler.log('28')
         
         if self.show:
             self.board.show_board()
@@ -201,20 +231,28 @@ class TicTacToe(Game):
                 self.rewards.append(reward)
                 
                 player.on_game_end(reward)
+
+        # profiler.log('29')
             
   
     def play_game(self):
         
-        for player in self.players:
-            player.clear()
+        # for player in self.players:
+        #     player.clear()
         
         if self.show:
             self.board.show_board()
+        
+        # profiler.log(0)
 
         while not self.is_game_over():
+
+            # profiler.log(1)
                         
             self.next_player()
             self.current_player.turn()
+
+            # profiler.log(2)
 
             if self.show:
                 self.board.show_board()
@@ -225,8 +263,12 @@ class TicTacToe(Game):
         
         me_mask = torch.tensor(self.board.board == player_id, dtype=torch.float32)
         them_mask = torch.tensor(self.board.board == -player_id, dtype=torch.float32)
-        
         state = torch.stack([me_mask, them_mask])
+        
+        # me_mask = np.array(self.board.board == player_id, dtype=np.float32)
+        # them_mask = np.array(self.board.board == -player_id, dtype=np.float32)
+        
+        # state = np.stack([me_mask, them_mask])
         
         return state
 
@@ -236,54 +278,81 @@ class TTTPlayer(Player):
         self.player_id = player_id
         self.game = None
         self.agent = agent
+        self.record = self.agent.history is not None   # bool, use history or not
         super().__init__(player_id, self.game, self.agent)
-        self.clear()
+        # self.clear()
     
     def attach_game(self, game):
         self.game = game
 
-    def clear(self):
-        # at init and game start
+    # def clear(self):
+    #     # at init and game start
         
-        self.states = []
-        self.possible_actions = []
-        self.actions = []
+    #     self.states = []
+    #     self.possible_actions = []
+    #     self.actions = []
         
     def turn(self):
         
         assert self.game is not None, 'No game attached to player {}'.format(self.player_id)
+        # profiler.log(3)
         
-        # record state
-        self.states.append(self.game.encode_state(self))
+        encoded_state = self.game.encode_state(self)
+        # profiler.log(4)
+        if self.record:
+            # record state
+            # self.states.append(encoded_state)
+            self.game.states[self].append(encoded_state)
         
         possible_moves = self.game.possible_moves(self)
-        # record possible actions
-        self.possible_actions.append(onehot_mask(possible_moves, 9))
+        # profiler.log(5)
+        if self.record:
+            # record possible actions
+            # self.possible_actions.append(onehot_mask(possible_moves, 9))
+            self.game.possible_actions[self].append(onehot_mask(possible_moves, 9))
+            # profiler.log(6)
 
-        action = self.agent.choose(self.game, self, possible_moves)        
-        # record action
-        self.actions.append(action)
+        action = self.agent.choose(self.game, self, possible_moves, encoded_state=encoded_state)
+        # profiler.log(7)
+        if self.record:
+            # record action
+            # self.actions.append(action)
+            self.game.actions[self].append(action)
         
         row, col = idx_to_rowcol(action)
+        # profiler.log(8)
         self.game.board.place_piece(row, col, self.player_id)
+        # profiler.log(9)
     
     def on_game_end(self, final_reward):
         
-        states = self.states
-        next_states = self.states[1:] + [states[-1]]   # last entry should not matter (fr_mix == 1)
-        next_state_possible_actions = self.possible_actions[1:] + [self.possible_actions[-1]]
-        
-        assert len(self.actions) == len(next_states) == len(states)
-        
-        # mix final reward with stage-by-stage
-        fr_mix = np.ones_like(self.actions, dtype=np.float32)
-        for i in range(1, len(fr_mix)):
-            fr_mix[i] = fr_mix[i-1]*self.agent.gamma
-        # reverse
-        fr_mix = fr_mix[::-1]    # 0-1
-       
-        for s, a, ns, nspa, fr_m in zip(states, self.actions, next_states, next_state_possible_actions, fr_mix):
-            self.agent.history.update(s, a, ns, nspa, fr_m, final_reward)
+        if self.record:
+            
+            # states = self.states
+            # next_states = self.states[1:] + [states[-1]]   # last entry should not matter (fr_mix == 1)
+            # next_state_possible_actions = self.possible_actions[1:] + [self.possible_actions[-1]]
+            
+            states = self.game.states[self]
+            possible_actions = self.game.possible_actions[self]
+            actions = self.game.actions[self]
+
+            next_states = states[1:] + [states[-1]]   # last entry should not matter (fr_mix == 1)
+            next_state_possible_actions = possible_actions[1:] + [possible_actions[-1]]
+            
+            # assert len(self.actions) == len(next_states) == len(states)
+            assert len(actions) == len(next_states) == len(states)
+            
+            # mix final reward with stage-by-stage
+            # fr_mix = np.ones_like(self.actions, dtype=np.float32)
+            fr_mix = np.ones_like(actions, dtype=np.float32)
+            for i in range(1, len(fr_mix)):
+                fr_mix[i] = fr_mix[i-1]*self.agent.gamma
+            # reverse
+            fr_mix = fr_mix[::-1]    # 0-1
+           
+            # for s, a, ns, nspa, fr_m in zip(states, self.actions, next_states, next_state_possible_actions, fr_mix):
+            for s, a, ns, nspa, fr_m in zip(states, actions, next_states, next_state_possible_actions, fr_mix):
+                self.agent.history.update(s, a, ns, nspa, fr_m, final_reward)
         
 
 
@@ -331,11 +400,19 @@ class History:
         batch_final_rewards = [self.final_rewards[i] for i in batch_idxs]
         
         batch_states = torch.stack(batch_states)
+        # batch_states = torch.tensor(np.stack(batch_states))
         batch_actions = torch.tensor(batch_actions, dtype=int)
         batch_next_states = torch.stack(batch_next_states)
+        # batch_next_states = torch.tensor(np.stack(batch_next_states))
         batch_nspas = torch.tensor(batch_nspas)
         batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32)
         batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32)
+        # batch_states = torch.stack(batch_states).to(dml)
+        # batch_actions = torch.tensor(batch_actions, dtype=int).to(dml)
+        # batch_next_states = torch.stack(batch_next_states).to(dml)
+        # batch_nspas = torch.tensor(batch_nspas).to(dml)
+        # batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32).to(dml)
+        # batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32).to(dml)
         
         return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards
         
@@ -344,11 +421,13 @@ class TTTRandomAgent(Agent):
     
     def __init__(self):
         super().__init__()
-        self.history = History()
+        self.history = None
         
-    def choose(self, game, player, possible_moves):
+    def choose(self, game, player, possible_moves, encoded_state=None):
         
-        return np.random.choice(possible_moves)
+        move = np.random.choice(possible_moves)
+        # profiler.log('rchoice')
+        return move
 
 class DLAgent(Agent):
 
@@ -358,22 +437,33 @@ class DLAgent(Agent):
         self.model = model
         self.losses = []
         
-    def choose(self, game, player, possible_moves):
+    def choose(self, game, player, possible_moves, encoded_state=None):
         
-        self.model.eval()
+        # self.model.eval()
+        # profiler.log(10)
         
-        encoded_state = game.encode_state(player)
+        if encoded_state is None:
+            encoded_state = game.encode_state(player)
+        # profiler.log(11)
         batched_state = encoded_state.unsqueeze(0)
+        # profiler.log(12)
         output = self.model(batched_state)
+        # profiler.log(13)
+        # output = self.model(batched_state.to(dml))
         
         # todo various choice algos (prob distribution, eps-greedy etc.)
         if random.random() < self.epsilon:
-            return np.random.choice(possible_moves)
+            move = np.random.choice(possible_moves)
+            # profiler.log(14)
+            return move
         else:
             # greedy
             possible_moves_outputs = output[0][possible_moves]
+            # profiler.log(15)
             best_move_idx = possible_moves_outputs.argmax()
+            # profiler.log(16)
             best_move = possible_moves[best_move_idx]
+            # profiler.log(17)
             
             return best_move
 
@@ -389,8 +479,7 @@ class DLAgent(Agent):
          batch_final_rewards) = self.history.yield_batch(batch_size)
                 
         outputs = self.model(batch_states)
-        # outputs = outputs.squeeze()
-        state_action_outputs = outputs.gather(1, batch_actions.unsqueeze(-1))
+        state_action_outputs = outputs.gather(1, batch_actions.unsqueeze(-1)).squeeze()
         
         with torch.no_grad():
             next_state_outputs = self.model(batch_next_states)
@@ -403,7 +492,6 @@ class DLAgent(Agent):
             next_state_values = next_state_values.values
         
         targets = batch_fr_mix * batch_final_rewards + (1 - batch_fr_mix) * next_state_values
-
         
         loss = self.model.loss(state_action_outputs, targets)
         self.model.optimizer.zero_grad()
@@ -414,25 +502,33 @@ class DLAgent(Agent):
         self.losses.append(loss_scalar)
         
         self.model.optimizer.step()
+
+        self.model.eval()
     
     def train_n_batches(self, n, batch_size=16):
         
         for i in range(n):
             self.train_batch(batch_size=batch_size)
+        
                 
 
-class ConvModel(nn.Module):
+class TTTConvModel(nn.Module):
 
-    def __init__(self, layer_1_size, linear_size, lr=1e-3):
+    def __init__(self, layer_1_size, linear_size, lr=1e-3, padding=True):
         super().__init__()
         self.layer_1_size = layer_1_size
         self.linear_size = linear_size
         self.lr = lr
         
-        self.conv1 = Conv2d(2, layer_1_size, 3, padding='same')
+        if padding:
+            pad_text, l1_size = 'same', layer_1_size * 3 * 3
+        else:
+            pad_text, l1_size = 'valid', layer_1_size
+            
+        self.conv1 = Conv2d(2, layer_1_size, 3, padding=pad_text)
         self.bn1 = nn.BatchNorm2d(layer_1_size)
         
-        self.linear1 = nn.Linear(layer_1_size * 3 * 3, linear_size)
+        self.linear1 = nn.Linear(l1_size, linear_size)
         self.linear2 = nn.Linear(linear_size, 9)
 
         self.activation = nn.LeakyReLU()
@@ -455,49 +551,85 @@ class ConvModel(nn.Module):
         l = self.linear2(l)
         
         return l    
-    
+
 
 # trial random game
 random_agent = TTTRandomAgent()
-playerX = TTTPlayer(1, random_agent)
 
-model = ConvModel(32, 16)
+model = TTTConvModel(32, 16)
+# model.to(dml)
+model.eval()
 dlagent = DLAgent(model)
+
+# playerX = TTTPlayer(1, random_agent)
+playerX = TTTPlayer(1, dlagent)
 playerO = TTTPlayer(-1, dlagent)
 players = [playerX, playerO]
 
-def play_series(players, num_games):
+def play_series(players, num_games, asy=False):
     
     win_counter = [0 for p in players] + [0] # ties
     
-    for i in range(num_games):
-        
-        game = TicTacToe(players)
-        game.play_game()
-        
-        if game.winner_index is None:
-            win_counter[-1] += 1
-        else:
-            win_counter[game.winner_index] += 1
+    if asy:
+
+        async def play_many():
+
+            async def play_once():
+                game = TicTacToe(players)
+                game.play_game()
+                
+                if game.winner_index is None:
+                    win_counter[-1] += 1
+                else:
+                    win_counter[game.winner_index] += 1
+            
+            res = await asyncio.gather(*(play_once() for i in range(num_games)))
     
+        asyncio.run(play_many())
+    
+    else:
+        
+        for i in range(num_games):
+            game = TicTacToe(players)
+            game.play_game()
+            
+            if game.winner_index is None:
+                win_counter[-1] += 1
+            else:
+                win_counter[game.winner_index] += 1
+            
+
     names = ['X', 'O', 'Tie']
     plt.bar(names, win_counter)
     plt.show()
 
 start_time = time.time()
+last_time = start_time
+play_time, train_time = 0, 0
 
+# await play_series(players, 1000)
+# asyncio.run(play_series(players, 1000))
 play_series(players, 1000)
 
-for i in range(5):
+play_time += time.time() - last_time
+last_time = time.time()
+
+for i in range(100):
     
     print()
     print(i)
     
-    playerO.agent.train_n_batches(100)
+    print('Training...')
+    playerO.agent.train_n_batches(1000)
     plt.plot(moving_average(playerO.agent.losses))
     plt.show()
+    train_time += time.time() - last_time
+    last_time = time.time()
     
+    print('Playing...')
     play_series(players, 1000)
+    play_time += time.time() - last_time
+    last_time = time.time()
 
 end_time = time.time()
 tdiff = end_time - start_time
@@ -505,3 +637,8 @@ tdiff = end_time - start_time
 plt.plot(moving_average(playerO.agent.losses))
 
 print('Time taken: {:.2f} s'.format(tdiff))
+print('Play time: {:.2f} s'.format(play_time))
+print('Train time: {:.2f} s'.format(train_time))
+
+# print()
+# profiler.display()
