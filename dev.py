@@ -19,6 +19,7 @@ import asyncio
 import nest_asyncio
 
 from utils import Profiler
+from sumtree import SumTree
 
 nest_asyncio.apply()
 
@@ -360,64 +361,165 @@ class TTTPlayer(Player):
 
 class History:
 
-    def __init__(self, max_len=1e5):
-        self.states = deque()
-        self.actions = deque()
-        self.next_states = deque()
-        self.next_state_possible_actions = deque()
-        self.fr_mix = deque()
-        self.final_rewards = deque()
+    def __init__(self, max_len=100000, per=False, eps=1e-2, alpha=0.1, beta=0.1):
+
+        # self.states = deque()
+        # self.actions = deque()
+        # self.next_states = deque()
+        # self.next_state_possible_actions = deque()
+        # self.fr_mix = deque()
+        # self.final_rewards = deque()
+        self.states = [None] * max_len
+        self.actions = [None] * max_len
+        self.next_states = [None] * max_len
+        self.next_state_possible_actions = [None] * max_len
+        self.fr_mix = [None] * max_len
+        self.final_rewards = [None] * max_len
+        
+        
         self.max_len = max_len
+        self.per = per    # Prioritized Experience Replay
         self.length = 0
+        self.counter = 0
+
+        if self.per:
+            
+            self.tree = SumTree(size=max_len)
+            
+            # PER params
+            self.eps = eps  # minimal priority, prevents zero probabilities
+            self.alpha = alpha  # determines how much prioritization is used, α = 0 corresponding to the uniform case
+            self.beta = beta  # determines the amount of importance-sampling correction, b = 1 fully compensate for the non-uniform probabilities
+            self.max_priority = eps  # priority for new samples, init as eps
 
     def update(self, state, action, next_state, nspa, fr_mix, final_reward):
-        self.states.append(state)
-        self.actions.append(action)
-        self.next_states.append(next_state)
-        self.next_state_possible_actions.append(nspa)
-        self.fr_mix.append(fr_mix)
-        self.final_rewards.append(final_reward)
-        self.length += 1
         
-        if len(self.actions) > self.max_len:
+        # self.states.append(state)
+        # self.actions.append(action)
+        # self.next_states.append(next_state)
+        # self.next_state_possible_actions.append(nspa)
+        # self.fr_mix.append(fr_mix)
+        # self.final_rewards.append(final_reward)
+        # self.length += 1
+        
+        if self.per:
+            # store transition index with maximum priority in sum tree
+            self.tree.add(self.max_priority, self.counter)
 
-            for dat in [self.states, self.actions, self.next_states, self.next_state_possible_actions, self.fr_mix, self.final_rewards]:
-                dat.popleft()
-                assert len(dat) <= self.max_len
-            self.length -= 1
+        self.states[self.counter] = state
+        self.actions[self.counter] = action
+        self.next_states[self.counter] = next_state
+        self.next_state_possible_actions[self.counter] = nspa
+        self.fr_mix[self.counter] = fr_mix
+        self.final_rewards[self.counter] = final_reward
+        
+        # if len(self.actions) > self.max_len:
+
+        #     for dat in [self.states, self.actions, self.next_states, self.next_state_possible_actions, self.fr_mix, self.final_rewards]:
+        #         dat.popleft()
+        #         assert len(dat) <= self.max_len
+        #     self.length -= 1
             
-        assert self.length == len(self.actions), 'Invalid length for History'
+        # assert self.length == len(self.actions), 'Invalid length for History'
 
-    def yield_batch(self, batch_size):
-        bs = batch_size if len(self.actions) >= batch_size else len(self.actions)
+        self.counter = (self.counter + 1) % self.max_len
+        self.length = min(self.max_len, self.length + 1)
+
+    def data_from_indexes(self, indexes):
         
-        # choose randomly without deletion
-        batch_idxs = random.sample(range(self.length), bs)
-        
-        batch_states = [self.states[i] for i in batch_idxs]
-        batch_actions = [self.actions[i] for i in batch_idxs]
-        batch_next_states = [self.next_states[i] for i in batch_idxs]
-        batch_nspas = [self.next_state_possible_actions[i] for i in batch_idxs]
-        batch_fr_mix = [self.fr_mix[i] for i in batch_idxs]
-        batch_final_rewards = [self.final_rewards[i] for i in batch_idxs]
+        batch_states = [self.states[i] for i in indexes]
+        batch_actions = [self.actions[i] for i in indexes]
+        batch_next_states = [self.next_states[i] for i in indexes]
+        batch_nspas = [self.next_state_possible_actions[i] for i in indexes]
+        batch_fr_mix = [self.fr_mix[i] for i in indexes]
+        batch_final_rewards = [self.final_rewards[i] for i in indexes]
         
         batch_states = torch.stack(batch_states)
-        # batch_states = torch.tensor(np.stack(batch_states))
         batch_actions = torch.tensor(batch_actions, dtype=int)
         batch_next_states = torch.stack(batch_next_states)
-        # batch_next_states = torch.tensor(np.stack(batch_next_states))
         batch_nspas = torch.tensor(batch_nspas)
         batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32)
         batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32)
-        # batch_states = torch.stack(batch_states).to(dml)
-        # batch_actions = torch.tensor(batch_actions, dtype=int).to(dml)
-        # batch_next_states = torch.stack(batch_next_states).to(dml)
-        # batch_nspas = torch.tensor(batch_nspas).to(dml)
-        # batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32).to(dml)
-        # batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32).to(dml)
         
         return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards
+
+    def sample_uniform(self, batch_size):
+        bs = batch_size if len(self.actions) >= batch_size else len(self.actions)
         
+        # choose randomly without deletion
+        sample_idxs = random.sample(range(self.length), bs)
+        
+        # batch_states = [self.states[i] for i in batch_idxs]
+        # batch_actions = [self.actions[i] for i in batch_idxs]
+        # batch_next_states = [self.next_states[i] for i in batch_idxs]
+        # batch_nspas = [self.next_state_possible_actions[i] for i in batch_idxs]
+        # batch_fr_mix = [self.fr_mix[i] for i in batch_idxs]
+        # batch_final_rewards = [self.final_rewards[i] for i in batch_idxs]
+        
+        # batch_states = torch.stack(batch_states)
+        # batch_actions = torch.tensor(batch_actions, dtype=int)
+        # batch_next_states = torch.stack(batch_next_states)
+        # batch_nspas = torch.tensor(batch_nspas)
+        # batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32)
+        # batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32)
+        
+        batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards = self.data_from_indexes(sample_idxs)
+        
+        return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards
+    
+    def sample_per(self, batch_size):
+        bs = batch_size if len(self.actions) >= batch_size else len(self.actions)
+        
+        sample_idxs, tree_idxs = [], []
+        priorities = torch.empty(bs, 1, dtype=torch.float)
+
+        # To sample a minibatch of size k, the range [0, p_total] is divided equally into k ranges.
+        # Next, a value is uniformly sampled from each range. Finally the transitions that correspond
+        # to each of these sampled values are retrieved from the tree. (Appendix B.2.1, Proportional prioritization)
+        segment = self.tree.total / batch_size
+        for i in range(batch_size):
+            a, b = segment * i, segment * (i + 1)
+
+            cumsum = random.uniform(a, b)
+            # sample_idx is a sample index in buffer, needed further to sample actual transitions
+            # tree_idx is a index of a sample in the tree, needed further to update priorities
+            tree_idx, priority, sample_idx = self.tree.get(cumsum)
+
+            priorities[i] = priority
+            tree_idxs.append(tree_idx)
+            sample_idxs.append(sample_idx)
+        
+        probs = priorities / self.tree.total
+        
+        weights = (self.length * probs) ** -self.beta
+        weights = weights / weights.max()
+        
+        batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards = self.data_from_indexes(sample_idxs)
+        
+        return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards, weights, tree_idxs
+    
+    def yield_batch(self, batch_size):
+        
+        if not self.per:
+            
+            return self.sample_uniform(batch_size)
+        
+        else:
+            
+            return self.sample_per(batch_size)
+
+    def update_priorities(self, data_idxs, priorities):
+        if isinstance(priorities, torch.Tensor):
+            priorities = priorities.detach().cpu().numpy()
+
+        for data_idx, priority in zip(data_idxs, priorities):
+            # The first variant we consider is the direct, proportional prioritization where p_i = |δ_i| + eps,
+            # where eps is a small positive constant that prevents the edge-case of transitions not being
+            # revisited once their error is zero. (Section 3.3)
+            priority = (priority + self.eps) ** self.alpha
+
+            self.tree.update(data_idx, priority)
+            self.max_priority = max(self.max_priority, priority)        
 
 class TTTRandomAgent(Agent):
     
@@ -433,9 +535,11 @@ class TTTRandomAgent(Agent):
 
 class DLAgent(Agent):
 
-    def __init__(self, model, gamma=0.95):
+    def __init__(self, model, gamma=0.95, per=False):
+        self.gamma = gamma
+        self.per = per
         super().__init__(gamma=gamma)
-        self.history = History()
+        self.history = History(per=per)
         self.model = model
         self.losses = []
         
@@ -472,13 +576,26 @@ class DLAgent(Agent):
     def train_batch(self, batch_size=16):
         
         self.model.train()
-                
-        (batch_states, 
-         batch_actions, 
-         batch_next_states, 
-         batch_nspas, 
-         batch_fr_mix, 
-         batch_final_rewards) = self.history.yield_batch(batch_size)
+        
+        if self.per:
+            (batch_states, 
+             batch_actions, 
+             batch_next_states, 
+             batch_nspas, 
+             batch_fr_mix, 
+             batch_final_rewards,
+             weights,    # TODO not currently using, needed for double-Q (see link in sumtree.py)
+             tree_idxs,
+             ) = self.history.yield_batch(batch_size)
+        else:
+            (batch_states, 
+             batch_actions, 
+             batch_next_states, 
+             batch_nspas, 
+             batch_fr_mix, 
+             batch_final_rewards
+             ) = self.history.yield_batch(batch_size)
+
                 
         outputs = self.model(batch_states)
         state_action_outputs = outputs.gather(1, batch_actions.unsqueeze(-1)).squeeze()
@@ -495,6 +612,9 @@ class DLAgent(Agent):
         
         targets = batch_fr_mix * batch_final_rewards + (1 - batch_fr_mix) * next_state_values
         
+        # for PER
+        td_error = torch.abs(state_action_outputs - targets).detach()
+        
         loss = self.model.loss(state_action_outputs, targets)
         self.model.optimizer.zero_grad()
         loss.backward()
@@ -504,6 +624,10 @@ class DLAgent(Agent):
         self.losses.append(loss_scalar)
         
         self.model.optimizer.step()
+        
+        if self.per:
+            # update PER priorities
+            self.history.update_priorities(tree_idxs, td_error)
 
         self.model.eval()
     
@@ -576,7 +700,8 @@ model = TTTConvModel(16, 16, 50)
 # model.to(dml)
 model.eval()
 gamma = 0.65
-dlagent = DLAgent(model, gamma=gamma)
+PER = True
+dlagent = DLAgent(model, gamma=gamma, per=PER)
 
 # playerX = TTTPlayer(1, random_agent)
 playerX = TTTPlayer(1, dlagent)
@@ -647,7 +772,7 @@ for i in range(500):
     last_time = time.time()
     
     if i % 10 == 9:
-        n_tests = 10
+        # n_tests = 100
         print('Testing...')
         # todo should we not store history during this part?
         play_determinative(players, [True, False], n_tests, title='DetX')
