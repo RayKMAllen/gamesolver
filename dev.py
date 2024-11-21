@@ -26,9 +26,9 @@ nest_asyncio.apply()
 
 class Agent:
     
-    def __init__(self, gamma=0.95, epsilon=0.1):
+    def __init__(self, gamma=0.95):
         self.gamma = gamma          # reward discount per step
-        self.epsilon = epsilon      # exploration control
+        # self.epsilon = epsilon      # exploration control
         pass
     
 
@@ -42,9 +42,10 @@ class Game:
 
 class Player:
     
-    def __init__(self, player_id, game, agent=None):
+    def __init__(self, player_id, game, agent=None, epsilon=0.1):
         self.player_id = player_id
         self.game = game
+        self.epsilon = epsilon
         self.agent = agent
     
     def turn(self):
@@ -274,10 +275,11 @@ class TicTacToe(Game):
 
 class TTTPlayer(Player):
     
-    def __init__(self, player_id, agent):
+    def __init__(self, player_id, agent, epsilon=0.1):
         self.player_id = player_id
         self.game = None
         self.agent = agent
+        self.epsilon = epsilon
         self.record = self.agent.history is not None   # bool, use history or not
         super().__init__(player_id, self.game, self.agent)
         # self.clear()
@@ -431,14 +433,14 @@ class TTTRandomAgent(Agent):
 
 class DLAgent(Agent):
 
-    def __init__(self, model):
-        super().__init__()
+    def __init__(self, model, gamma=0.95):
+        super().__init__(gamma=gamma)
         self.history = History()
         self.model = model
         self.losses = []
         
     def choose(self, game, player, possible_moves, encoded_state=None):
-        
+
         # self.model.eval()
         # profiler.log(10)
         
@@ -452,7 +454,7 @@ class DLAgent(Agent):
         # output = self.model(batched_state.to(dml))
         
         # todo various choice algos (prob distribution, eps-greedy etc.)
-        if random.random() < self.epsilon:
+        if random.random() < player.epsilon:
             move = np.random.choice(possible_moves)
             # profiler.log(14)
             return move
@@ -514,19 +516,25 @@ class DLAgent(Agent):
 
 class TTTConvModel(nn.Module):
 
-    def __init__(self, layer_1_size, linear_size, lr=1e-3, padding=True):
+    def __init__(self, layer_1_size, layer_2_size, linear_size, lr=1e-3, padding=True):
         super().__init__()
         self.layer_1_size = layer_1_size
+        self.layer_2_size = layer_2_size
         self.linear_size = linear_size
         self.lr = lr
         
         if padding:
-            pad_text, l1_size = 'same', layer_1_size * 3 * 3
+            # pad_text, l1_size = 'same', layer_1_size * 3 * 3
+            pad_text, l1_size = 'same', layer_2_size * 3 * 3
         else:
-            pad_text, l1_size = 'valid', layer_1_size
+            # pad_text, l1_size = 'valid', layer_1_size
+            pad_text, l1_size = 'valid', layer_2_size
             
         self.conv1 = Conv2d(2, layer_1_size, 3, padding=pad_text)
         self.bn1 = nn.BatchNorm2d(layer_1_size)
+            
+        self.conv2 = Conv2d(layer_1_size, layer_2_size, 3, padding=pad_text)
+        self.bn2 = nn.BatchNorm2d(layer_2_size)
         
         self.linear1 = nn.Linear(l1_size, linear_size)
         self.linear2 = nn.Linear(linear_size, 9)
@@ -541,6 +549,10 @@ class TTTConvModel(nn.Module):
         
         c = self.conv1(x)
         c = self.bn1(c)
+        c = self.activation(c)
+        
+        c = self.conv2(c)
+        c = self.bn2(c)
         
         c = c.flatten(start_dim=1)
         
@@ -550,86 +562,97 @@ class TTTConvModel(nn.Module):
         l = self.activation(l)
         l = self.linear2(l)
         
+        l = torch.tanh(l)
+        
         return l    
 
 
 # trial random game
 random_agent = TTTRandomAgent()
 
-model = TTTConvModel(32, 16)
+# model = TTTConvModel(32, 16)
+# model = TTTConvModel(64, 32, 32)
+model = TTTConvModel(16, 16, 50)
 # model.to(dml)
 model.eval()
-dlagent = DLAgent(model)
+gamma = 0.65
+dlagent = DLAgent(model, gamma=gamma)
 
 # playerX = TTTPlayer(1, random_agent)
 playerX = TTTPlayer(1, dlagent)
 playerO = TTTPlayer(-1, dlagent)
 players = [playerX, playerO]
 
-def play_series(players, num_games, asy=False):
+def play_series(players, num_games, title=None):
+    
+    if title is None:
+        title = 'Ordinary'
     
     win_counter = [0 for p in players] + [0] # ties
-    
-    if asy:
 
-        async def play_many():
-
-            async def play_once():
-                game = TicTacToe(players)
-                game.play_game()
-                
-                if game.winner_index is None:
-                    win_counter[-1] += 1
-                else:
-                    win_counter[game.winner_index] += 1
-            
-            res = await asyncio.gather(*(play_once() for i in range(num_games)))
-    
-        asyncio.run(play_many())
-    
-    else:
+    for i in range(num_games):
+        game = TicTacToe(players)
+        game.play_game()
         
-        for i in range(num_games):
-            game = TicTacToe(players)
-            game.play_game()
+        if game.winner_index is None:
+            win_counter[-1] += 1
+        else:
+            win_counter[game.winner_index] += 1
             
-            if game.winner_index is None:
-                win_counter[-1] += 1
-            else:
-                win_counter[game.winner_index] += 1
-            
-
     names = ['X', 'O', 'Tie']
     plt.bar(names, win_counter)
+    plt.title(title)
     plt.show()
+
+def play_determinative(players, det_bools, num_games, title=None):
+    
+    assert len(players) == len(det_bools)
+    
+    stashed_eps = [p.epsilon for p in players]
+    
+    for p, p_det_bool in zip(players, det_bools):
+        if p_det_bool:
+            p.epsilon = 0
+    
+    play_series(players, num_games, title=title)
+
+    for p, p_det_bool, eps in zip(players, det_bools, stashed_eps):
+        if p_det_bool:
+            p.epsilon = eps
 
 start_time = time.time()
 last_time = start_time
 play_time, train_time = 0, 0
 
-# await play_series(players, 1000)
-# asyncio.run(play_series(players, 1000))
 play_series(players, 1000)
 
 play_time += time.time() - last_time
 last_time = time.time()
 
-for i in range(100):
+for i in range(500):
     
     print()
     print(i)
     
     print('Training...')
-    playerO.agent.train_n_batches(1000)
+    playerO.agent.train_n_batches(100)
     plt.plot(moving_average(playerO.agent.losses))
     plt.show()
     train_time += time.time() - last_time
     last_time = time.time()
     
     print('Playing...')
-    play_series(players, 1000)
+    play_series(players, 100)
     play_time += time.time() - last_time
     last_time = time.time()
+    
+    if i % 10 == 9:
+        n_tests = 10
+        print('Testing...')
+        # todo should we not store history during this part?
+        play_determinative(players, [True, False], n_tests, title='DetX')
+        play_determinative(players, [False, True], n_tests, title='DetO')
+        # play_determinative(players, [True, True], n_tests, title='DetBoth')
 
 end_time = time.time()
 tdiff = end_time - start_time
