@@ -19,11 +19,9 @@ import asyncio
 import nest_asyncio
 
 from utils import Profiler
-from sumtree import SumTree
+from history import History
 
 nest_asyncio.apply()
-
-# dml = torch_directml.device()    
 
 class Agent:
     
@@ -113,8 +111,6 @@ class TTTBoard:
         assert self.is_valid_move(row, col), 'Index {}/{} of board is not 0, == {}'.format(row, col, self.board[row][col])
         
         self.board[row][col] = player_id
-
-profiler = Profiler()
 
 class TicTacToe(Game):
     
@@ -358,169 +354,6 @@ class TTTPlayer(Player):
                 self.agent.history.update(s, a, ns, nspa, fr_m, final_reward)
         
 
-
-class History:
-
-    def __init__(self, max_len=100000, per=False, eps=1e-2, alpha=0.1, beta=0.1):
-
-        # self.states = deque()
-        # self.actions = deque()
-        # self.next_states = deque()
-        # self.next_state_possible_actions = deque()
-        # self.fr_mix = deque()
-        # self.final_rewards = deque()
-        self.states = [None] * max_len
-        self.actions = [None] * max_len
-        self.next_states = [None] * max_len
-        self.next_state_possible_actions = [None] * max_len
-        self.fr_mix = [None] * max_len
-        self.final_rewards = [None] * max_len
-        
-        
-        self.max_len = max_len
-        self.per = per    # Prioritized Experience Replay
-        self.length = 0
-        self.counter = 0
-
-        if self.per:
-            
-            self.tree = SumTree(size=max_len)
-            
-            # PER params
-            self.eps = eps  # minimal priority, prevents zero probabilities
-            self.alpha = alpha  # determines how much prioritization is used, α = 0 corresponding to the uniform case
-            self.beta = beta  # determines the amount of importance-sampling correction, b = 1 fully compensate for the non-uniform probabilities
-            self.max_priority = eps  # priority for new samples, init as eps
-
-    def update(self, state, action, next_state, nspa, fr_mix, final_reward):
-        
-        # self.states.append(state)
-        # self.actions.append(action)
-        # self.next_states.append(next_state)
-        # self.next_state_possible_actions.append(nspa)
-        # self.fr_mix.append(fr_mix)
-        # self.final_rewards.append(final_reward)
-        # self.length += 1
-        
-        if self.per:
-            # store transition index with maximum priority in sum tree
-            self.tree.add(self.max_priority, self.counter)
-
-        self.states[self.counter] = state
-        self.actions[self.counter] = action
-        self.next_states[self.counter] = next_state
-        self.next_state_possible_actions[self.counter] = nspa
-        self.fr_mix[self.counter] = fr_mix
-        self.final_rewards[self.counter] = final_reward
-        
-        # if len(self.actions) > self.max_len:
-
-        #     for dat in [self.states, self.actions, self.next_states, self.next_state_possible_actions, self.fr_mix, self.final_rewards]:
-        #         dat.popleft()
-        #         assert len(dat) <= self.max_len
-        #     self.length -= 1
-            
-        # assert self.length == len(self.actions), 'Invalid length for History'
-
-        self.counter = (self.counter + 1) % self.max_len
-        self.length = min(self.max_len, self.length + 1)
-
-    def data_from_indexes(self, indexes):
-        
-        batch_states = [self.states[i] for i in indexes]
-        batch_actions = [self.actions[i] for i in indexes]
-        batch_next_states = [self.next_states[i] for i in indexes]
-        batch_nspas = [self.next_state_possible_actions[i] for i in indexes]
-        batch_fr_mix = [self.fr_mix[i] for i in indexes]
-        batch_final_rewards = [self.final_rewards[i] for i in indexes]
-        
-        batch_states = torch.stack(batch_states)
-        batch_actions = torch.tensor(batch_actions, dtype=int)
-        batch_next_states = torch.stack(batch_next_states)
-        batch_nspas = torch.tensor(batch_nspas)
-        batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32)
-        batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32)
-        
-        return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards
-
-    def sample_uniform(self, batch_size):
-        bs = batch_size if len(self.actions) >= batch_size else len(self.actions)
-        
-        # choose randomly without deletion
-        sample_idxs = random.sample(range(self.length), bs)
-        
-        # batch_states = [self.states[i] for i in batch_idxs]
-        # batch_actions = [self.actions[i] for i in batch_idxs]
-        # batch_next_states = [self.next_states[i] for i in batch_idxs]
-        # batch_nspas = [self.next_state_possible_actions[i] for i in batch_idxs]
-        # batch_fr_mix = [self.fr_mix[i] for i in batch_idxs]
-        # batch_final_rewards = [self.final_rewards[i] for i in batch_idxs]
-        
-        # batch_states = torch.stack(batch_states)
-        # batch_actions = torch.tensor(batch_actions, dtype=int)
-        # batch_next_states = torch.stack(batch_next_states)
-        # batch_nspas = torch.tensor(batch_nspas)
-        # batch_fr_mix = torch.tensor(batch_fr_mix, dtype=torch.float32)
-        # batch_final_rewards = torch.tensor(batch_final_rewards, dtype=torch.float32)
-        
-        batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards = self.data_from_indexes(sample_idxs)
-        
-        return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards
-    
-    def sample_per(self, batch_size):
-        bs = batch_size if len(self.actions) >= batch_size else len(self.actions)
-        
-        sample_idxs, tree_idxs = [], []
-        priorities = torch.empty(bs, 1, dtype=torch.float)
-
-        # To sample a minibatch of size k, the range [0, p_total] is divided equally into k ranges.
-        # Next, a value is uniformly sampled from each range. Finally the transitions that correspond
-        # to each of these sampled values are retrieved from the tree. (Appendix B.2.1, Proportional prioritization)
-        segment = self.tree.total / batch_size
-        for i in range(batch_size):
-            a, b = segment * i, segment * (i + 1)
-
-            cumsum = random.uniform(a, b)
-            # sample_idx is a sample index in buffer, needed further to sample actual transitions
-            # tree_idx is a index of a sample in the tree, needed further to update priorities
-            tree_idx, priority, sample_idx = self.tree.get(cumsum)
-
-            priorities[i] = priority
-            tree_idxs.append(tree_idx)
-            sample_idxs.append(sample_idx)
-        
-        probs = priorities / self.tree.total
-        
-        weights = (self.length * probs) ** -self.beta
-        weights = weights / weights.max()
-        
-        batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards = self.data_from_indexes(sample_idxs)
-        
-        return batch_states, batch_actions, batch_next_states, batch_nspas, batch_fr_mix, batch_final_rewards, weights, tree_idxs
-    
-    def yield_batch(self, batch_size):
-        
-        if not self.per:
-            
-            return self.sample_uniform(batch_size)
-        
-        else:
-            
-            return self.sample_per(batch_size)
-
-    def update_priorities(self, data_idxs, priorities):
-        if isinstance(priorities, torch.Tensor):
-            priorities = priorities.detach().cpu().numpy()
-
-        for data_idx, priority in zip(data_idxs, priorities):
-            # The first variant we consider is the direct, proportional prioritization where p_i = |δ_i| + eps,
-            # where eps is a small positive constant that prevents the edge-case of transitions not being
-            # revisited once their error is zero. (Section 3.3)
-            priority = (priority + self.eps) ** self.alpha
-
-            self.tree.update(data_idx, priority)
-            self.max_priority = max(self.max_priority, priority)        
-
 class TTTRandomAgent(Agent):
     
     def __init__(self):
@@ -640,28 +473,63 @@ class DLAgent(Agent):
 
 class TTTConvModel(nn.Module):
 
-    def __init__(self, layer_1_size, layer_2_size, linear_size, lr=1e-3, padding=True):
+    # def __init__(self, layer_1_size, layer_2_size, linear_size, lr=1e-3, padding=True):
+    def __init__(self, input_channels, input_dimensions, num_actions, conv_layer_sizes, linear_sizes, kernel_size=3, stride=1, lr=1e-3, padding=True):
         super().__init__()
-        self.layer_1_size = layer_1_size
-        self.layer_2_size = layer_2_size
-        self.linear_size = linear_size
+        # self.layer_1_size = layer_1_size
+        # self.layer_2_size = layer_2_size
+        # self.linear_size = linear_size
+        self.input_channels = input_channels
+        self.input_dimensions = input_dimensions    # (num_rows, num_columns)
+        self.num_actions = num_actions
+        self.conv_layer_sizes = conv_layer_sizes
+        self.linear_sizes = linear_sizes
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
         self.lr = lr
+        
+        self.conv_layers = []
+        self.bn_layers = []
+        self.linear_layers = []
+        
+        assert len(self.input_dimensions) == 2, 'Invalid input dimensions {}'.format(self.input_dimensions)
         
         if padding:
             # pad_text, l1_size = 'same', layer_1_size * 3 * 3
-            pad_text, l1_size = 'same', layer_2_size * 3 * 3
+            # pad_text, l1_size = 'same', layer_2_size * 3 * 3
+            pad_text, l1_size = 'same', self.conv_layer_sizes[-1] * self.input_dimensions[0] * self.input_dimensions[1]
         else:
             # pad_text, l1_size = 'valid', layer_1_size
-            pad_text, l1_size = 'valid', layer_2_size
+            pad_text, l1_size = 'valid', self.conv_layer_sizes[-1] * (self.input_dimensions[0] - 2) * (self.input_dimensions[1] - 2)
+                
+        # self.conv1 = Conv2d(2, layer_1_size, 3, padding=pad_text)
+        # self.bn1 = nn.BatchNorm2d(layer_1_size)
             
-        self.conv1 = Conv2d(2, layer_1_size, 3, padding=pad_text)
-        self.bn1 = nn.BatchNorm2d(layer_1_size)
-            
-        self.conv2 = Conv2d(layer_1_size, layer_2_size, 3, padding=pad_text)
-        self.bn2 = nn.BatchNorm2d(layer_2_size)
+        # self.conv2 = Conv2d(layer_1_size, layer_2_size, 3, padding=pad_text)
+        # self.bn2 = nn.BatchNorm2d(layer_2_size)
         
-        self.linear1 = nn.Linear(l1_size, linear_size)
-        self.linear2 = nn.Linear(linear_size, 9)
+        # init conv, bn layers
+        layer_input_channels = self.input_channels
+        for conv_layer_size in self.conv_layer_sizes:
+            conv = Conv2d(layer_input_channels, conv_layer_size, self.kernel_size, padding=pad_text)
+            bn = nn.BatchNorm2d(conv_layer_size)
+            self.conv_layers.append(conv)
+            self.bn_layers.append(bn)
+            
+            layer_input_channels = conv_layer_size
+        
+        linear_input_size = l1_size
+        for linear_size in self.linear_sizes:
+            linear_layer = nn.Linear(linear_input_size, linear_size)
+            self.linear_layers.append(linear_layer)
+            
+            linear_input_size = linear_size
+        
+        self.final_linear_layer = nn.Linear(linear_input_size, self.num_actions)
+        
+        # self.linear1 = nn.Linear(l1_size, linear_size)
+        # self.linear2 = nn.Linear(linear_size, 9)
 
         self.activation = nn.LeakyReLU()
         
@@ -671,24 +539,40 @@ class TTTConvModel(nn.Module):
         
     def forward(self, x):
         
-        c = self.conv1(x)
-        c = self.bn1(c)
-        c = self.activation(c)
+        # c = self.conv1(x)
+        # c = self.bn1(c)
+        # c = self.activation(c)
         
-        c = self.conv2(c)
-        c = self.bn2(c)
+        # c = self.conv2(c)
+        # c = self.bn2(c)
         
-        c = c.flatten(start_dim=1)
+        # c = c.flatten(start_dim=1)
         
-        c = self.activation(c)
+        # c = self.activation(c)
         
-        l = self.linear1(c)
-        l = self.activation(l)
-        l = self.linear2(l)
+        for conv, bn in zip(self.conv_layers, self.bn_layers):
+            x = conv(x)
+            x = bn(x)
+            x = self.activation(x)
         
-        l = torch.tanh(l)
+        x = x.flatten(start_dim=1)
         
-        return l    
+        for lin in self.linear_layers:
+            x = lin(x)
+            x = self.activation(x)
+        
+        # l = self.linear1(c)
+        # l = self.activation(l)
+        # l = self.linear2(l)
+        
+        x = self.final_linear_layer(x)
+        
+        # l = torch.tanh(l)
+        
+        # TODO make this flexible, not just tanh
+        x = torch.tanh(x)
+        
+        return x
 
 
 # trial random game
@@ -696,7 +580,8 @@ random_agent = TTTRandomAgent()
 
 # model = TTTConvModel(32, 16)
 # model = TTTConvModel(64, 32, 32)
-model = TTTConvModel(16, 16, 50)
+# model = TTTConvModel(16, 16, 50)
+model = TTTConvModel(2, (3, 3), 9, [16, 16], [50])
 # model.to(dml)
 model.eval()
 gamma = 0.65
@@ -772,7 +657,7 @@ for i in range(500):
     last_time = time.time()
     
     if i % 10 == 9:
-        # n_tests = 100
+        n_tests = 10
         print('Testing...')
         # todo should we not store history during this part?
         play_determinative(players, [True, False], n_tests, title='DetX')
