@@ -489,9 +489,9 @@ class TTTConvModel(nn.Module):
         self.padding = padding
         self.lr = lr
         
-        self.conv_layers = []
-        self.bn_layers = []
-        self.linear_layers = []
+        self.conv_layers = nn.ModuleList([])
+        self.bn_layers = nn.ModuleList([])
+        self.linear_layers = nn.ModuleList([])
         
         assert len(self.input_dimensions) == 2, 'Invalid input dimensions {}'.format(self.input_dimensions)
         
