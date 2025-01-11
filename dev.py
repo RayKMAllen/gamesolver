@@ -588,21 +588,34 @@ gamma = 0.65
 PER = True
 dlagent = DLAgent(model, gamma=gamma, per=PER)
 
+one_player_det = False
+
 # playerX = TTTPlayer(1, random_agent)
 playerX = TTTPlayer(1, dlagent)
 playerO = TTTPlayer(-1, dlagent)
 players = [playerX, playerO]
 
-def play_series(players, num_games, title=None):
+def play_series(players, num_games, one_player_det=False, title=None):
     
     if title is None:
         title = 'Ordinary'
     
     win_counter = [0 for p in players] + [0] # ties
-
+    stashed_eps = [p.epsilon for p in players]
+    
     for i in range(num_games):
+        
+        if one_player_det:
+            # make a random player play determinatively, to reduce noise in training set
+            det_player_index = random.randint(0, len(players)-1)
+            players[det_player_index].epsilon = 0
+        
         game = TicTacToe(players)
         game.play_game()
+
+        if one_player_det:
+            # reset epsilon to initial value
+            players[det_player_index].epsilon = stashed_eps[det_player_index]
         
         if game.winner_index is None:
             win_counter[-1] += 1
@@ -634,12 +647,12 @@ start_time = time.time()
 last_time = start_time
 play_time, train_time = 0, 0
 
-play_series(players, 1000)
+play_series(players, 1000, one_player_det=one_player_det)
 
 play_time += time.time() - last_time
 last_time = time.time()
 
-for i in range(500):
+for i in range(1000):
     
     print()
     print(i)
@@ -656,8 +669,10 @@ for i in range(500):
     play_time += time.time() - last_time
     last_time = time.time()
     
+    print('History length: {}'.format(playerX.agent.history.length))
+    
     if i % 10 == 9:
-        n_tests = 10
+        n_tests = 50
         print('Testing...')
         # todo should we not store history during this part?
         play_determinative(players, [True, False], n_tests, title='DetX')
