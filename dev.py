@@ -584,7 +584,7 @@ random_agent = TTTRandomAgent()
 model = TTTConvModel(2, (3, 3), 9, [16, 16], [50])
 # model.to(dml)
 model.eval()
-gamma = 0.65
+gamma = 0
 PER = True
 dlagent = DLAgent(model, gamma=gamma, per=PER)
 
