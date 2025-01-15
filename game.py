@@ -347,6 +347,8 @@ class CheckersBoard(Board):
             0: '.',
             1: 'B',
             -1: 'W',
+            2: 'K',
+            -2: 'Q',    # white king
             }
         
     def jumped_square(self, fr, fc, tr, tc):
@@ -362,9 +364,14 @@ class CheckersBoard(Board):
         return [br, bc]
     
     def basic_move_check(self, player_id, fr, fc, tr, tc):
+        
+        if min(fr, fc, tr, tc) < 0:
+            return False
+        if max(fr, fc, tr, tc) > 7:
+            return False
 
         current = self.board[fr][fc]
-        if current != player_id:
+        if current not in [player_id, 2*player_id]:    # 2x for king
             return False
         if self.board[tr][tc] != 0:
             return False
@@ -389,6 +396,10 @@ class CheckersBoard(Board):
             # col check already done
             return True
         
+        # king-backwards
+        if row_diff == player_id and self.board[fr][fc] == 2 * player_id:
+            return True
+        
         return False
     
     def is_valid_capture(self, player_id, fr, fc, tr, tc):
@@ -399,34 +410,55 @@ class CheckersBoard(Board):
         row_diff, col_diff = tr - fr, tc - fc
         
         # single capture
-        if row_diff == -2 * player_id:
+        # regular or king-backwards
+        if row_diff == -2 * player_id or (row_diff == 2 * player_id and self.board[fr][fc] == 2 * player_id):
             # get space between, check for opp player piece
             jumped_square = self.jumped_square(fr, fc, tr, tc)
             if jumped_square is not None:
                 [br, bc] = jumped_square
-                if self.board[br][bc] == - player_id:
+                # if self.board[br][bc] == - player_id:
+                if self.board[br][bc] in [-player_id, -2*player_id]:
                     return True
         
         return False
     
+    def check_make_king(self, player_id, piece_id, tr, tc):
+
+        if piece_id in [1, -1]:
+            # make king check
+            if player_id == 1 and tr == 0:
+                # black king
+                print('Black king!')
+                self.board[tr][tc] = 2*player_id
+            elif player_id == -1 and tr == 7:
+                # white king
+                print('White king!')
+                self.board[tr][tc] = 2*player_id        
+    
     def do_walk(self, player_id, fr, fc, tr, tc):
         
         assert self.is_valid_walk(player_id, fr, fc, tr, tc), 'Invalid walk: player {}, from {}/{}, to {}/{}'.format(player_id, fr, fc, tr, tc)
+        piece_id = self.board[fr][fc]    # piece or king
         
         self.board[fr][fc] = 0
-        self.board[tr][tc] = player_id        
+        self.board[tr][tc] = piece_id
+        
+        self.check_make_king(player_id, piece_id, tr, tc)
     
     def do_capture(self, player_id, fr, fc, tr, tc):
         
         assert self.is_valid_capture(player_id, fr, fc, tr, tc), 'Invalid capture: player {}, from {}/{}, to {}/{}'.format(player_id, fr, fc, tr, tc)
+        piece_id = self.board[fr][fc]    # piece or king
         
         self.board[fr][fc] = 0
-        self.board[tr][tc] = player_id        
+        self.board[tr][tc] = piece_id        
         jumped_square = self.jumped_square(fr, fc, tr, tc)
         if jumped_square is None:
             raise Exception('Invalid capture: player {} jumped square is None ({}/{} to {}/{})'.format(player_id, fr, fc, tr, tc))
         [br, bc] = jumped_square
         self.board[br][bc] = 0
+
+        self.check_make_king(player_id, piece_id, tr, tc)
         
 class Checkers(Game):
     
@@ -434,6 +466,7 @@ class Checkers(Game):
         super().__init__(players)
         self.board = CheckersBoard()
         self.show = show
+        self.num_turns = 0
     
     def possible_moves(self, player):
     
@@ -463,6 +496,20 @@ class Checkers(Game):
         
         return possible_walks
     
+    def possible_captures_from(self, player, fr, fc):
+        # for multicaptures
+        
+        player_id = player.player_id
+
+        possible_captures = []
+        for tr in [fr-2, fr+2]:
+            for tc in [fc-2, fc+2]:
+                if self.board.is_valid_capture(player_id, fr, fc, tr, tc):
+                    possible_captures.append((player_id, fr, fc, tr, tc))
+        
+        return possible_captures
+
+    
     def is_game_over(self):
         
         for i, player in enumerate(self.players):
@@ -474,12 +521,6 @@ class Checkers(Game):
                 opponent = self.players[(i+1)%2]
                 self.on_game_end(winner=opponent)
                 return True
-        
-        if len(self.possible_moves(self.current_player)) == 0:
-            # player loses
-            opponent = self.players[(self.current_player_index+1)%2]
-            self.on_game_end(winner=opponent)
-            return True
         
         return False
     
@@ -519,10 +560,14 @@ class Checkers(Game):
         while not self.is_game_over():
                         
             self.next_player()
-            self.current_player.turn()
+            early_exit = self.current_player.turn()
+            self.num_turns += 1
 
             if self.show:
                 self.board.show_board()
+            
+            if early_exit:
+                break
 
     def encode_state(self, player):
         
@@ -530,8 +575,12 @@ class Checkers(Game):
         
         # TODO add kings
         me_mask = torch.tensor(self.board.board == player_id, dtype=torch.float32)
+        me_king_mask = torch.tensor(self.board.board == 2*player_id, dtype=torch.float32)
         them_mask = torch.tensor(self.board.board == -player_id, dtype=torch.float32)
-        state = torch.stack([me_mask, them_mask])
+        them_king_mask = torch.tensor(self.board.board == -2*player_id, dtype=torch.float32)
+        
+        # what should order be?
+        state = torch.stack([me_mask, me_king_mask, them_mask, them_king_mask])
         
         return state
 
@@ -555,11 +604,21 @@ class CheckersPlayer(Player):
             self.game.states[self].append(encoded_state)
         
         possible_moves = self.game.possible_moves(self)
+        # check for game end
+        if len(possible_moves) == 0:
+            # player loses
+            opponent = self.game.players[(self.game.current_player_index+1)%2]
+            self.game.on_game_end(winner=opponent)
+            # early exit
+            return True
+
         if self.record:
             # record possible actions
             # TODO think about how to encode
             self.game.possible_actions[self].append(possible_moves)
 
+        print('Possible moves:')
+        print(possible_moves)
         action = self.agent.choose(self.game, self, possible_moves, encoded_state=encoded_state)
         if self.record:
             # record action
@@ -568,13 +627,40 @@ class CheckersPlayer(Player):
         # row, col = idx_to_rowcol(action)
         # self.game.board.place_piece(row, col, self.player_id)
         (pid, fr, fc, tr, tc) = action
+        print('Action: ', action)
         assert pid == self.player_id, 'Invalid action player id'
         
         capture = (tr - fr) in [-2, 2]
         if capture:
             self.game.board.do_capture(pid, fr, fc, tr, tc)
+            
+            # TODO multi-captures
+            possible_multicaptures = self.game.possible_captures_from(self, tr, tc)
+            while len(possible_multicaptures) > 0:
+                
+                print('Multicapturing!')
+
+                if self.game.show:
+                    self.game.board.show_board()
+
+                encoded_state = self.game.encode_state(self)
+                action = self.agent.choose(self.game, self, possible_multicaptures, encoded_state=encoded_state)
+                if self.record:
+                    # record state etc
+                    self.game.states[self].append(encoded_state)
+                    self.game.possible_actions[self].append(possible_multicaptures)
+                    self.game.actions[self].append(action)
+
+                (pid, fr, fc, tr, tc) = action
+                self.game.board.do_capture(pid, fr, fc, tr, tc)
+
+                possible_multicaptures = self.game.possible_captures_from(self, tr, tc)                
+            
         else:
             self.game.board.do_walk(pid, fr, fc, tr, tc)
+        
+        # early exit bool
+        return False
     
     def on_game_end(self, final_reward):
         
@@ -607,9 +693,9 @@ board = CheckersBoard()
 
 # board.board[3][2] = 1
 # board.board[4][3] = 1
-board.board[3][2] = -1
-board.board[4][3] = -1
-board.show_board()
+# board.board[3][2] = -1
+# board.board[4][3] = -1
+# board.show_board()
 
 # # cumbersome move check
 # for player_id in [1, -1]:
@@ -621,4 +707,17 @@ board.show_board()
 #                         print(player_id, fr, fc, tr, tc)
 #                         board.move_piece(player_id, fr, fc, tr, tc)
 #                         board.show_board()
+
+
+from agent import RandomAgent
+
+rand_agent = RandomAgent()
+
+p1 = CheckersPlayer(1, rand_agent)
+p2 = CheckersPlayer(-1, rand_agent)
+players = [p1, p2]
+
+game = Checkers(players, show=True)
+game.play_game()
+
 

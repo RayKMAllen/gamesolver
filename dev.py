@@ -21,28 +21,11 @@ import nest_asyncio
 from utils import Profiler, moving_average
 from history import History
 from game import TicTacToe, TTTPlayer
+from agent import Agent, RandomAgent
 
 nest_asyncio.apply()
 
-class Agent:
-    
-    def __init__(self, gamma=0.95):
-        self.gamma = gamma          # reward discount per step
-        # self.epsilon = epsilon      # exploration control
-        pass
-        
 
-class RandomAgent(Agent):
-    
-    def __init__(self):
-        super().__init__()
-        self.history = None
-        
-    def choose(self, game, player, possible_moves, encoded_state=None):
-        
-        move = np.random.choice(possible_moves)
-        # profiler.log('rchoice')
-        return move
 
 class DLAgent(Agent):
 
